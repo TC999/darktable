@@ -53,7 +53,7 @@ dt_decoration=$(git describe --tags --match release-* |
 # Hot-fix for the compiler version if necessary
 if [[ -n $CLANG_VERSION ]]; then
     CV=$CLANG_VERSION
-    sed -i "s/\(Clang.*\)COMPILER_VERSION VERSION_LESS [0-9][0-9]/\1COMPILER_VERSION VERSION_LESS $CV/" \
+    sed -i "s/\(.*\"Clang\".*\)COMPILER_VERSION VERSION_LESS [0-9][0-9]/\1COMPILER_VERSION VERSION_LESS $CV/" \
         cmake/compiler-versions.cmake \
         src/external/rawspeed/cmake/compiler-versions.cmake
 fi
@@ -93,10 +93,6 @@ tar xf "$DT_SRC_DIR/darktable-$dt_decoration.tar"
 echo "* creating version header"
 "$DT_SRC_DIR/tools/create_version_c.sh" \
     "darktable-$dt_decoration/src/version_gen.c" "$dt_decoration"
-
-# drop regression_tests. for internal use, and need git anyway
-echo "* removing tools/regression_tests"
-rm -rf darktable-"$dt_decoration"/tools/regression_tests
 
 # drop integration tests
 echo "* removing src/tests/integration"

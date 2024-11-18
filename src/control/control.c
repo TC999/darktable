@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2023 darktable developers.
+    Copyright (C) 2009-2024 darktable developers.
     Copyright (c) 2012 James C. McPherson
 
     darktable is free software: you can redistribute it and/or modify
@@ -272,6 +272,8 @@ gboolean dt_control_running()
 {
   // FIXME: when shutdown, run_mutex is not inited anymore!
   dt_control_t *s = darktable.control;
+  if(!s)
+    return FALSE;
   dt_pthread_mutex_lock(&s->run_mutex);
   const gboolean running = s->running;
   dt_pthread_mutex_unlock(&s->run_mutex);
@@ -280,21 +282,29 @@ gboolean dt_control_running()
 
 void dt_control_quit()
 {
-  dt_gui_gtk_quit();
   // thread safe quit, 1st pass:
-  dt_pthread_mutex_lock(&darktable.control->cond_mutex);
-  dt_pthread_mutex_lock(&darktable.control->run_mutex);
-  darktable.control->running = FALSE;
-  dt_pthread_mutex_unlock(&darktable.control->run_mutex);
-  dt_pthread_mutex_unlock(&darktable.control->cond_mutex);
-
-  gtk_main_quit();
+  if(darktable.control)
+  {
+    dt_pthread_mutex_lock(&darktable.control->cond_mutex);
+    dt_pthread_mutex_lock(&darktable.control->run_mutex);
+    darktable.control->running = FALSE;
+    dt_pthread_mutex_unlock(&darktable.control->run_mutex);
+    dt_pthread_mutex_unlock(&darktable.control->cond_mutex);
+  }
+  if(g_atomic_int_get(&darktable.gui_running))
+  {
+    dt_gui_gtk_quit();
+    gtk_main_quit();
+  }
 }
 
 void dt_control_shutdown(dt_control_t *s)
 {
+  if(!s)
+    return;
   dt_pthread_mutex_lock(&s->cond_mutex);
   dt_pthread_mutex_lock(&s->run_mutex);
+  gboolean was_running = s->running;
   s->running = FALSE;
   dt_pthread_mutex_unlock(&s->run_mutex);
   dt_pthread_mutex_unlock(&s->cond_mutex);
@@ -304,6 +314,9 @@ void dt_control_shutdown(dt_control_t *s)
 #ifdef HAVE_GPHOTO2
   pthread_join(s->update_gphoto_thread, NULL);
 #endif
+  if(!was_running)
+    return;		// if not running, there are no threads to join
+
   /* then wait for kick_on_workers_thread */
   pthread_join(s->kick_on_workers_thread, NULL);
 
@@ -319,6 +332,8 @@ void dt_control_shutdown(dt_control_t *s)
 
 void dt_control_cleanup(dt_control_t *s)
 {
+  if(!s)
+    return;
   // vacuum TODO: optional?
   // DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db), "PRAGMA incremental_vacuum(0)", NULL, NULL, NULL);
   // DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db), "vacuum", NULL, NULL, NULL);
@@ -494,7 +509,6 @@ static void _dt_ctl_switch_mode_prepare()
 {
   darktable.control->button_down = 0;
   darktable.control->button_down_which = 0;
-  darktable.gui->center_tooltip = 0;
   GtkWidget *widget = dt_ui_center(darktable.gui->ui);
   gtk_widget_set_tooltip_text(widget, "");
   gtk_widget_grab_focus(widget);
@@ -549,8 +563,7 @@ void dt_ctl_switch_mode()
 static gboolean _dt_ctl_log_message_timeout_callback(gpointer data)
 {
   dt_pthread_mutex_lock(&darktable.control->log_mutex);
-  if(darktable.control->log_ack != darktable.control->log_pos)
-    darktable.control->log_ack = (darktable.control->log_ack + 1) % DT_CTL_LOG_SIZE;
+  darktable.control->log_ack = darktable.control->log_pos;
   darktable.control->log_message_timeout_id = 0;
   dt_pthread_mutex_unlock(&darktable.control->log_mutex);
   dt_control_log_redraw();
@@ -560,8 +573,7 @@ static gboolean _dt_ctl_log_message_timeout_callback(gpointer data)
 static gboolean _dt_ctl_toast_message_timeout_callback(gpointer data)
 {
   dt_pthread_mutex_lock(&darktable.control->toast_mutex);
-  if(darktable.control->toast_ack != darktable.control->toast_pos)
-    darktable.control->toast_ack = (darktable.control->toast_ack + 1) % DT_CTL_TOAST_SIZE;
+  darktable.control->toast_ack = darktable.control->toast_pos;
   darktable.control->toast_message_timeout_id = 0;
   dt_pthread_mutex_unlock(&darktable.control->toast_mutex);
   dt_control_toast_redraw();
@@ -589,33 +601,37 @@ void dt_control_button_pressed(double x,
   dt_pthread_mutex_lock(&darktable.control->log_mutex);
   const double /*xc = wd/4.0-20,*/ yc = ht * 0.85 + 10.0;
   if(darktable.control->log_ack != darktable.control->log_pos)
-    if(which == 1 /*&& x > xc - 10 && x < xc + 10*/ && y > yc - 10.0 && y < yc + 10.0)
+  {
+    if(which == 1 && y > yc - 10.0 && y < yc + 10.0)
     {
       if(darktable.control->log_message_timeout_id)
       {
         g_source_remove(darktable.control->log_message_timeout_id);
         darktable.control->log_message_timeout_id = 0;
       }
-      darktable.control->log_ack = (darktable.control->log_ack + 1) % DT_CTL_LOG_SIZE;
+      darktable.control->log_ack = darktable.control->log_pos;
       dt_pthread_mutex_unlock(&darktable.control->log_mutex);
       return;
     }
+  }
   dt_pthread_mutex_unlock(&darktable.control->log_mutex);
 
   // ack toast message:
   dt_pthread_mutex_lock(&darktable.control->toast_mutex);
   if(darktable.control->toast_ack != darktable.control->toast_pos)
-    if(which == 1 /*&& x > xc - 10 && x < xc + 10*/ && y > yc - 10.0 && y < yc + 10.0)
+  {
+    if(which == 1 && y > yc - 10.0 && y < yc + 10.0)
     {
       if(darktable.control->toast_message_timeout_id)
       {
         g_source_remove(darktable.control->toast_message_timeout_id);
         darktable.control->toast_message_timeout_id = 0;
       }
-      darktable.control->toast_ack = (darktable.control->toast_ack + 1) % DT_CTL_TOAST_SIZE;
+      darktable.control->toast_ack = darktable.control->toast_pos;
       dt_pthread_mutex_unlock(&darktable.control->toast_mutex);
       return;
     }
+  }
   dt_pthread_mutex_unlock(&darktable.control->toast_mutex);
 
   if(!dt_view_manager_button_pressed(darktable.view_manager, x, y,
@@ -637,14 +653,23 @@ void dt_control_log(const char *msg, ...)
   va_start(ap, msg);
   char *escaped_msg = g_markup_vprintf_escaped(msg, ap);
   const int msglen = strlen(escaped_msg);
-  g_strlcpy(darktable.control->log_message[darktable.control->log_pos],
-            escaped_msg, DT_CTL_LOG_MSG_SIZE);
+
+  const int old_idx = (darktable.control->log_pos - 1) & (DT_CTL_LOG_SIZE-1);
+  const gboolean timeout = darktable.control->log_message_timeout_id;
+  const gboolean new = timeout && (g_strcmp0(escaped_msg, darktable.control->log_message[old_idx]) != 0);
+
+  if(new)
+  {
+    g_strlcpy(darktable.control->log_message[darktable.control->log_pos & (DT_CTL_LOG_SIZE-1)],
+              escaped_msg, DT_CTL_LOG_MSG_SIZE);
+    darktable.control->log_pos++;
+  }
+
   g_free(escaped_msg);
   va_end(ap);
-  if(darktable.control->log_message_timeout_id)
+
+  if(timeout)
     g_source_remove(darktable.control->log_message_timeout_id);
-  darktable.control->log_ack = darktable.control->log_pos;
-  darktable.control->log_pos = (darktable.control->log_pos + 1) % DT_CTL_LOG_SIZE;
 
   darktable.control->log_message_timeout_id
     = g_timeout_add(DT_CTL_LOG_TIMEOUT + 1000 * (msglen / 40),
@@ -660,20 +685,20 @@ static void _toast_log(const gboolean markup, const char *msg, va_list ap)
 
   // if we don't want markup, we escape <>&... so they are not interpreted later
   if(markup)
-    vsnprintf(darktable.control->toast_message[darktable.control->toast_pos],
+    vsnprintf(darktable.control->toast_message[darktable.control->toast_pos & (DT_CTL_TOAST_SIZE-1)],
               DT_CTL_TOAST_MSG_SIZE, msg, ap);
   else
   {
     char *escaped_msg = g_markup_vprintf_escaped(msg, ap);
-    g_strlcpy(darktable.control->toast_message[darktable.control->toast_pos],
+    g_strlcpy(darktable.control->toast_message[darktable.control->toast_pos & (DT_CTL_TOAST_SIZE-1)],
               escaped_msg, DT_CTL_TOAST_MSG_SIZE);
     g_free(escaped_msg);
   }
+  darktable.control->toast_pos++;
 
   if(darktable.control->toast_message_timeout_id)
     g_source_remove(darktable.control->toast_message_timeout_id);
-  darktable.control->toast_ack = darktable.control->toast_pos;
-  darktable.control->toast_pos = (darktable.control->toast_pos + 1) % DT_CTL_TOAST_SIZE;
+
   darktable.control->toast_message_timeout_id
       = g_timeout_add(DT_CTL_TOAST_TIMEOUT, _dt_ctl_toast_message_timeout_callback, NULL);
   dt_pthread_mutex_unlock(&darktable.control->toast_mutex);
@@ -700,7 +725,7 @@ void dt_toast_markup_log(const char *msg, ...)
 static void _control_log_ack_all()
 {
   dt_pthread_mutex_lock(&darktable.control->log_mutex);
-  darktable.control->log_pos = darktable.control->log_ack;
+  darktable.control->log_ack = darktable.control->log_pos;
   dt_pthread_mutex_unlock(&darktable.control->log_mutex);
   dt_control_queue_redraw_center();
 }
@@ -739,27 +764,27 @@ void dt_control_toast_busy_leave()
 
 void dt_control_queue_redraw()
 {
-  DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_CONTROL_REDRAW_ALL);
+  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_REDRAW_ALL);
 }
 
 void dt_control_queue_redraw_center()
 {
-  DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_CONTROL_REDRAW_CENTER);
+  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_REDRAW_CENTER);
 }
 
 void dt_control_navigation_redraw()
 {
-  DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_CONTROL_NAVIGATION_REDRAW);
+  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_NAVIGATION_REDRAW);
 }
 
 void dt_control_log_redraw()
 {
-  DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_CONTROL_LOG_REDRAW);
+  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_LOG_REDRAW);
 }
 
 void dt_control_toast_redraw()
 {
-  DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_CONTROL_TOAST_REDRAW);
+  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_TOAST_REDRAW);
 }
 
 static int _widget_queue_draw(void *widget)
@@ -780,34 +805,6 @@ void dt_control_queue_redraw_widget(GtkWidget *widget)
 
 int dt_control_key_pressed_override(guint key, guint state)
 {
-#ifdef HAVE_GAME
-  // ↑ ↑ ↓ ↓ ← → ← → b a
-  static int konami_state = 0;
-  static guint konami_sequence[] = {
-    GDK_KEY_Up,
-    GDK_KEY_Up,
-    GDK_KEY_Down,
-    GDK_KEY_Down,
-    GDK_KEY_Left,
-    GDK_KEY_Right,
-    GDK_KEY_Left,
-    GDK_KEY_Right,
-    GDK_KEY_b,
-    GDK_KEY_a
-  };
-  if(key == konami_sequence[konami_state])
-  {
-    konami_state++;
-    if(konami_state == G_N_ELEMENTS(konami_sequence))
-    {
-      dt_ctl_switch_mode_to("knight");
-      konami_state = 0;
-    }
-  }
-  else
-    konami_state = 0;
-#endif
-
   // TODO: if darkroom mode
   // did a : vim-style command start?
   static GList *autocomplete = NULL;
@@ -934,7 +931,7 @@ void dt_control_set_mouse_over_id(const dt_imgid_t imgid)
   {
     darktable.control->mouse_over_id = imgid;
     dt_pthread_mutex_unlock(&(darktable.control->global_mutex));
-    DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_MOUSE_OVER_IMAGE_CHANGE);
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_MOUSE_OVER_IMAGE_CHANGE);
   }
   else
     dt_pthread_mutex_unlock(&(darktable.control->global_mutex));
